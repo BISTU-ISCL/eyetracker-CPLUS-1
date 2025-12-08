@@ -3,14 +3,19 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
 
+// Demo application showing how to wire the EyeTrackerCalibrator to a webcam.
+// It streams frames, gathers a 3x3 calibration grid, and prints pupil/gaze info.
+
 int main(int argc, char **argv)
 {
+    // Expect two files: Haar cascade (face detection) and LBF model (landmarks).
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <haar_cascade.xml> <lbfmodel.yaml>" << std::endl;
         return 1;
     }
 
     EyeTrackerCalibrator calibrator;
+    // Load detectors. Missing opencv_contrib face module will trigger failure here.
     if (!calibrator.loadModels(argv[1], argv[2])) {
         std::cerr << "Failed to load detector/landmark models" << std::endl;
         return 1;
@@ -43,6 +48,7 @@ int main(int argc, char **argv)
         bool ok = calibrator.processFrame(frame, targets, gaze, metrics, debug);
 
         if (ok) {
+            // Visualize predicted gaze on the debug frame.
             cv::circle(debug, gaze, 5, {0, 0, 255}, -1);
         } else {
             cv::putText(frame, "Tracking lost", {10, 20}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 0, 255}, 2);

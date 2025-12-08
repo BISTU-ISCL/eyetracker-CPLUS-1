@@ -3,6 +3,13 @@
 #include <chrono>
 #include <numeric>
 
+// Implementation of the calibration pipeline. The logic follows these steps:
+// 1. Detect the face and fit 68 landmarks using the LBF model.
+// 2. Compute head pose (rotation/translation) from six landmarks.
+// 3. Crop an eye ROI, detect the pupil (dark blob) and glint (bright blob).
+// 4. Update blink statistics using eye-aspect ratio.
+// 5. Collect calibration samples and regress pupil/glint offsets to gaze (dark-pupil setup).
+
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -30,10 +37,12 @@ EyeTrackerCalibrator::EyeTrackerCalibrator()
 bool EyeTrackerCalibrator::loadModels(const std::string &faceDetectorPath,
                                       const std::string &landmarkModelPath)
 {
+    // Load Haar cascade for face detection.
     if (!faceDetector_.load(faceDetectorPath)) {
         return false;
     }
 
+    // Load the LBF facemark model (requires opencv_contrib's face module).
     facemark_ = cv::face::FacemarkLBF::create();
     if (!facemark_->loadModel(landmarkModelPath)) {
         facemark_.release();
@@ -45,6 +54,7 @@ bool EyeTrackerCalibrator::loadModels(const std::string &faceDetectorPath,
 
 bool EyeTrackerCalibrator::detectFace(const cv::Mat &gray, cv::Rect &faceBox)
 {
+    // Find all faces and pick the largest (closest to the camera).
     std::vector<cv::Rect> faces;
     faceDetector_.detectMultiScale(gray, faces, 1.1, 3, 0, cv::Size(80, 80));
     if (faces.empty()) {
@@ -58,6 +68,7 @@ bool EyeTrackerCalibrator::detectFace(const cv::Mat &gray, cv::Rect &faceBox)
 bool EyeTrackerCalibrator::estimateLandmarks(const cv::Mat &gray, const cv::Rect &faceBox,
                                              std::vector<cv::Point2f> &landmarks)
 {
+    // Run landmark fitting constrained to the detected face box.
     std::vector<std::vector<cv::Point2f>> shapes;
     if (!facemark_ || !facemark_->fit(gray, {faceBox}, shapes) || shapes.empty()) {
         return false;
@@ -92,18 +103,24 @@ bool EyeTrackerCalibrator::estimateHeadPose(const std::vector<cv::Point2f> &land
                               0, 0, 1);
     cv::Mat distCoeffs = cv::Mat::zeros(4, 1, CV_64F);
 
+    // SolvePnP returns the rotation/translation aligning model points to image.
     return cv::solvePnP(model, imagePoints, cameraMatrix, distCoeffs, rvec, tvec, false, cv::SOLVEPNP_ITERATIVE);
 }
 
 bool EyeTrackerCalibrator::detectPupilAndGlint(const cv::Mat &eyeRoi, cv::Point2f &pupilCenter,
                                                cv::Point2f &glint, float &pupilDiameterPx)
 {
+    // Normalize contrast to make thresholding more stable and reduce noise so
+    // dark-pupil segmentation does not react to eyelashes or eyebrows.
     cv::Mat normalized;
     cv::equalizeHist(eyeRoi, normalized);
+    cv::Mat blurred;
+    cv::GaussianBlur(normalized, blurred, cv::Size(5, 5), 0);
 
-    // Pupil: dark blob detection
+    // Pupil: dark blob detection using Otsu to adapt to illumination changes
+    // typical in dark-pupil (non retro-reflective) imaging.
     cv::Mat binary;
-    cv::threshold(normalized, binary, 50, 255, cv::THRESH_BINARY_INV);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -118,6 +135,8 @@ bool EyeTrackerCalibrator::detectPupilAndGlint(const cv::Mat &eyeRoi, cv::Point2
     pupilDiameterPx = static_cast<float>((ellipse.size.width + ellipse.size.height) * 0.5f);
 
     // Glint: bright spot detection using thresholding
+    // Use the unblurred equalized frame to preserve specular peaks while
+    // operating under dark-pupil illumination.
     cv::threshold(normalized, binary, 230, 255, cv::THRESH_BINARY);
     cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (!contours.empty()) {
@@ -140,7 +159,7 @@ std::optional<cv::Point2f> EyeTrackerCalibrator::estimateGazePoint(const cv::Poi
         return std::nullopt;
     }
 
-    // Compute eye vector using pupil-glint offset (bright-pupil design)
+    // Compute eye vector using pupil-glint offset (dark-pupil design)
     cv::Point2f offset = pupilCenter - glint;
     double angleX = (offset.x / 320.0) * (kEyeFovDegrees * CV_PI / 180.0);
     double angleY = (offset.y / 240.0) * (kEyeFovDegrees * CV_PI / 180.0);
@@ -197,15 +216,19 @@ bool EyeTrackerCalibrator::processFrame(const cv::Mat &frame,
 {
     if (frame.empty()) return false;
 
+    // Convert to grayscale for detection pipelines.
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
+    // 1) Face detection.
     cv::Rect faceBox;
     if (!detectFace(gray, faceBox)) return false;
 
+    // 2) Landmark estimation.
     std::vector<cv::Point2f> landmarks;
     if (!estimateLandmarks(gray, faceBox, landmarks)) return false;
 
+    // 3) Head pose from a minimal set of landmarks.
     cv::Vec3d rvec, tvec;
     if (!estimateHeadPose(landmarks, rvec, tvec)) return false;
 
@@ -214,6 +237,7 @@ bool EyeTrackerCalibrator::processFrame(const cv::Mat &frame,
     eyeRect &= cv::Rect(0, 0, frame.cols, frame.rows);
     cv::Mat eyeRoi = gray(eyeRect);
 
+    // 4) Detect pupil center, glint, and pupil size.
     cv::Point2f pupil, glint;
     float diameter = 0.f;
     if (!detectPupilAndGlint(eyeRoi, pupil, glint, diameter)) return false;
@@ -239,6 +263,7 @@ bool EyeTrackerCalibrator::processFrame(const cv::Mat &frame,
         calibrationBuffer_.push_back({pupil, glint, screenCalibrationTargets[calibrationBuffer_.size()], rvec, tvec});
     }
 
+    // 5) Predict gaze using accumulated calibration and current observation.
     auto gaze = estimateGazePoint(pupil, glint, rvec, tvec);
     if (!gaze) return false;
     estimatedGaze = *gaze;
